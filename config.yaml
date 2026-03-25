@@ -451,6 +451,56 @@ rewards:
       valid_pokeflute_coords: 4.840555191040039
       valid_surf_coords: 4.8967742919921875
 
+  rubric_reward.RubricRewardEnv:
+    reward:
+      mode: step_delta
+      rubric_config:
+        rubrics:
+          story_progression: 3.0
+          exploration: 1.0
+          team_building: 0.5
+          resource_management: 0.3
+
+# Rubric RL / GRPO configuration.
+rubric_rl:
+  # GRPO hyperparameters
+  grpo:
+    # Number of rollouts per starting state (group size)
+    group_size: 8
+    # PPO-style clipping coefficient
+    clip_coef: 0.2
+    # KL penalty coefficient against collection-time policy
+    kl_coef: 0.01
+    # Number of training epochs per batch of episodes
+    update_epochs: 3
+    # Minibatch size for training
+    minibatch_size: 2048
+    # Learning rate
+    learning_rate: 0.0002
+    # Max gradient norm for clipping
+    max_grad_norm: 0.5
+    # Entropy bonus coefficient
+    ent_coef: 0.01
+    # Backprop through time horizon (for LSTM)
+    bptt_horizon: 16
+
+  # Meta-weights for combining rubrics
+  rubrics:
+    story_progression: 3.0
+    exploration: 1.0
+    team_building: 0.5
+    resource_management: 0.3
+
+  # Optional LLM judge configuration
+  llm_judge:
+    enabled: false
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
+    # How often to run LLM evaluation (every N episodes)
+    eval_frequency: 100
+    # Weight for blending LLM score with rule-based score (0 = rule only)
+    blend_weight: 0.0
+
 # Policies to use for training.
 # Each policy is keyed by a name for the commandline.
 # The value for each key is the list of policies to support.

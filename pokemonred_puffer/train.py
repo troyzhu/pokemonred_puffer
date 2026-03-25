@@ -24,6 +24,8 @@ import wandb
 from pokemonred_puffer import cleanrl_puffer
 from pokemonred_puffer.cleanrl_puffer import CleanPuffeRL
 from pokemonred_puffer.environment import RedGymEnv
+from pokemonred_puffer.rubric_rl.grpo import CleanGRPO, GRPOConfig, GRPOStateManager
+from pokemonred_puffer.rubric_rl.rubrics import build_composite_rubric
 from pokemonred_puffer.wrappers.async_io import AsyncWrapper
 from pokemonred_puffer.wrappers.sqlite import SqliteStateResetWrapper
 
@@ -60,7 +62,7 @@ def make_policy(env: RedGymEnv, policy_name: str, config: DictConfig) -> nn.Modu
 
 
 def load_from_config(config: DictConfig, debug: bool) -> DictConfig:
-    default_keys = ["env", "train", "policies", "rewards", "wrappers", "wandb"]
+    default_keys = ["env", "train", "policies", "rewards", "wrappers", "wandb", "rubric_rl"]
     defaults = OmegaConf.create({key: config.get(key, {}) for key in default_keys})
 
     # Package and subpackage (environment) configs
@@ -465,6 +467,132 @@ def train(
                     trainer.train()
 
             print("Done training")
+
+
+@app.command()
+def train_grpo(
+    config: Annotated[
+        DictConfig, typer.Option(help="Base configuration", parser=OmegaConf.load)
+    ] = DEFAULT_CONFIG,
+    policy_name: Annotated[
+        str,
+        typer.Option(
+            "--policy-name",
+            "-p",
+            help="Policy module to use in policies.",
+        ),
+    ] = DEFAULT_POLICY,
+    reward_name: Annotated[
+        str,
+        typer.Option(
+            "--reward-name",
+            "-r",
+            help="Reward module to use in rewards",
+        ),
+    ] = "rubric_reward.RubricRewardEnv",
+    wrappers_name: Annotated[
+        str,
+        typer.Option(
+            "--wrappers-name",
+            "-w",
+            help="Wrappers to use _in order of instantion_",
+        ),
+    ] = DEFAULT_WRAPPER,
+    exp_name: Annotated[str | None, typer.Option(help="Resume from experiment")] = None,
+    rom_path: Path = DEFAULT_ROM,
+    track: Annotated[bool, typer.Option(help="Track on wandb.")] = False,
+    debug: Annotated[bool, typer.Option(help="debug")] = False,
+    vectorization: Annotated[
+        Vectorization, typer.Option(help="Vectorization method")
+    ] = "multiprocessing",
+):
+    """Train using GRPO (Group Relative Policy Optimization) with rubric-based rewards."""
+    config = load_from_config(config, debug)
+    config.vectorization = vectorization
+    config, env_creator = setup(
+        config=config,
+        debug=debug,
+        wrappers_name=wrappers_name,
+        reward_name=reward_name,
+        rom_path=rom_path,
+        track=track,
+    )
+
+    # Build GRPO config from rubric_rl section
+    rubric_rl_config = config.get("rubric_rl", OmegaConf.create({}))
+    grpo_dict = dict(rubric_rl_config.get("grpo", {}))
+    grpo_config = GRPOConfig(**grpo_dict)
+
+    # Validate group size divides num_envs
+    assert config.train.num_envs % grpo_config.group_size == 0, (
+        f"num_envs ({config.train.num_envs}) must be divisible by "
+        f"group_size ({grpo_config.group_size})"
+    )
+
+    # Build rubric
+    rubric = build_composite_rubric(rubric_rl_config)
+
+    # Build state manager
+    state_manager = GRPOStateManager(
+        state_dir=Path(config.env.state_dir),
+        group_size=grpo_config.group_size,
+        num_groups=config.train.num_envs // grpo_config.group_size,
+    )
+
+    with init_wandb(
+        config=config,
+        exp_name=exp_name,
+        reward_name=reward_name,
+        policy_name=policy_name,
+        wrappers_name=wrappers_name,
+    ) as wandb_client:
+        vec = config.vectorization
+        if vec == Vectorization.serial:
+            vec = pufferlib.vector.Serial
+        elif vec == Vectorization.multiprocessing:
+            vec = pufferlib.vector.Multiprocessing
+        elif vec == Vectorization.ray:
+            vec = pufferlib.vector.Ray
+        else:
+            vec = pufferlib.vector.Multiprocessing
+
+        env_send_queues = []
+        env_recv_queues = []
+
+        vecenv = pufferlib.vector.make(
+            env_creator,
+            env_kwargs={
+                "env_config": config.env,
+                "wrappers_config": config.wrappers[wrappers_name],
+                "reward_config": config.rewards[reward_name]["reward"],
+                "async_config": {},
+                "sqlite_config": {"database": None},
+            },
+            num_envs=config.train.num_envs,
+            num_workers=config.train.num_workers,
+            batch_size=config.train.env_batch_size,
+            zero_copy=config.train.zero_copy,
+            backend=vec,
+        )
+        policy = make_policy(vecenv.driver_env, policy_name, config)
+
+        config.train.env = "Pokemon Red (GRPO)"
+        with CleanGRPO(
+            exp_name=exp_name,
+            config=config.train,
+            grpo_config=grpo_config,
+            vecenv=vecenv,
+            policy=policy,
+            rubric=rubric,
+            state_manager=state_manager,
+            env_send_queues=env_send_queues,
+            env_recv_queues=env_recv_queues,
+            wandb_client=wandb_client,
+        ) as trainer:
+            while not trainer.done_training():
+                trainer.run_epoch()
+
+        print("Done GRPO training")
 
 
 if __name__ == "__main__":
