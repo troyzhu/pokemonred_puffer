@@ -4,6 +4,11 @@
 
 This repo is designed as a library to be used for Pokemon Red RL development. It contains some convenience functions that should not be used in a library setting and should be forked. In the future, those convenience functions will be migrated so no forking is needed.
 
+## Documentation
+
+- [`docs/rubric_rl.md`](docs/rubric_rl.md) — Rubric-based GRPO trainer: structured rubric evaluation + group-relative policy optimization (alternative to the baseline PPO path).
+- [`docs/goal_rl.md`](docs/goal_rl.md) — Self-revising goal-setting layer on top of `rubric_rl`: free-text constitution, three-layer value schema, frozen evaluator, bounded LLM revision engine. Long-form concept pages, ADRs, and research notes live under [`docs/goal_rl/`](docs/goal_rl/).
+
 ## Quickstart
 
 ### Installation
