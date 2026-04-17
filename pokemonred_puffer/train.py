@@ -62,7 +62,16 @@ def make_policy(env: RedGymEnv, policy_name: str, config: DictConfig) -> nn.Modu
 
 
 def load_from_config(config: DictConfig, debug: bool) -> DictConfig:
-    default_keys = ["env", "train", "policies", "rewards", "wrappers", "wandb", "rubric_rl"]
+    default_keys = [
+        "env",
+        "train",
+        "policies",
+        "rewards",
+        "wrappers",
+        "wandb",
+        "rubric_rl",
+        "goal_rl",
+    ]
     defaults = OmegaConf.create({key: config.get(key, {}) for key in default_keys})
 
     # Package and subpackage (environment) configs
@@ -593,6 +602,223 @@ def train_grpo(
                 trainer.run_epoch()
 
         print("Done GRPO training")
+
+
+@app.command()
+def train_goal(
+    config: Annotated[
+        DictConfig, typer.Option(help="Base configuration", parser=OmegaConf.load)
+    ] = DEFAULT_CONFIG,
+    policy_name: Annotated[
+        str,
+        typer.Option("--policy-name", "-p", help="Policy module to use in policies."),
+    ] = DEFAULT_POLICY,
+    reward_name: Annotated[
+        str,
+        typer.Option("--reward-name", "-r", help="Reward module to use in rewards"),
+    ] = "rubric_reward.RubricRewardEnv",
+    wrappers_name: Annotated[
+        str,
+        typer.Option("--wrappers-name", "-w", help="Wrappers to use _in order of instantion_"),
+    ] = DEFAULT_WRAPPER,
+    exp_name: Annotated[str | None, typer.Option(help="Resume from experiment")] = None,
+    rom_path: Path = DEFAULT_ROM,
+    track: Annotated[bool, typer.Option(help="Track on wandb.")] = False,
+    debug: Annotated[bool, typer.Option(help="debug")] = False,
+    vectorization: Annotated[
+        Vectorization, typer.Option(help="Vectorization method")
+    ] = "multiprocessing",
+    constitution: Annotated[
+        str | None,
+        typer.Option(
+            "--constitution",
+            help="Override the constitution text from config.yaml",
+        ),
+    ] = None,
+    dry_run_revisions: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run-revisions",
+            help="Skip LLM revision calls (still run eval + triggers)",
+        ),
+    ] = False,
+):
+    """Train using the goal-setting RL layer on top of GRPO.
+
+    Reuses the GRPO trainer + RubricRewardEnv; layers a goal manager,
+    hybrid trigger controller, frozen evaluator, and LLM revision engine.
+
+    See docs/goal_rl.md for the full design contract.
+    """
+    # Local imports to avoid import-cost when using other commands.
+    from pokemonred_puffer.goal_rl.evaluator_frozen import (
+        FrozenEvaluator,
+        HackingWatchdog,
+        build_e2_rubric_from_config,
+    )
+    from pokemonred_puffer.goal_rl.goal_grpo import GoalGRPO, GoalRLRuntimeConfig
+    from pokemonred_puffer.goal_rl.goal_manager import GoalManager
+    from pokemonred_puffer.goal_rl.revision_engine import (
+        RevisionEngine,
+        RevisionEngineConfig,
+    )
+    from pokemonred_puffer.goal_rl.schema import build_config as build_goal_config
+    from pokemonred_puffer.goal_rl.triggers import TriggerConfig, TriggerController
+
+    config = load_from_config(config, debug)
+    config.vectorization = vectorization
+    config, env_creator = setup(
+        config=config,
+        debug=debug,
+        wrappers_name=wrappers_name,
+        reward_name=reward_name,
+        rom_path=rom_path,
+        track=track,
+    )
+
+    # --- GRPO base config (reused from rubric_rl section) ------------------
+    rubric_rl_config = config.get("rubric_rl", OmegaConf.create({}))
+    grpo_dict = dict(rubric_rl_config.get("grpo", {}))
+    grpo_config = GRPOConfig(**grpo_dict)
+
+    assert config.train.num_envs % grpo_config.group_size == 0, (
+        f"num_envs ({config.train.num_envs}) must be divisible by "
+        f"group_size ({grpo_config.group_size})"
+    )
+
+    # --- Goal-RL config ----------------------------------------------------
+    goal_rl_config = config.get("goal_rl", OmegaConf.create({}))
+    constitution_text = (
+        constitution
+        if constitution is not None
+        else str(goal_rl_config.get("constitution", "") or "")
+    )
+
+    trigger_dict = dict(goal_rl_config.get("triggers", {}))
+    trigger_cfg = TriggerConfig(**trigger_dict)
+
+    eval_dict = dict(goal_rl_config.get("evaluator", {}))
+    e2_override = eval_dict.get("e2_rubrics")
+    e2_rubric = build_e2_rubric_from_config({"rubrics": e2_override} if e2_override else None)
+    hacking_watchdog = HackingWatchdog(
+        window=int(eval_dict.get("watchdog_window", 3)),
+        training_rise_threshold=float(eval_dict.get("watchdog_training_rise", 0.05)),
+        e2_drop_threshold=float(eval_dict.get("watchdog_e2_drop", 0.05)),
+    )
+    frozen_evaluator = FrozenEvaluator(e2_rubric=e2_rubric, e3_rubric=None)
+
+    # --- Revision engine ---------------------------------------------------
+    rev_engine_dict = dict(goal_rl_config.get("revision_engine", {}))
+    rev_engine_cfg = RevisionEngineConfig(
+        provider=str(rev_engine_dict.get("provider", "anthropic")),
+        model=str(rev_engine_dict.get("model", "claude-haiku-4-5-20251001")),
+        max_tokens=int(rev_engine_dict.get("max_tokens", 1200)),
+        dry_run=bool(rev_engine_dict.get("dry_run", False)) or dry_run_revisions,
+    )
+
+    llm_client = None
+    if not rev_engine_cfg.dry_run:
+        try:
+            if rev_engine_cfg.provider == "anthropic":
+                import anthropic
+
+                llm_client = anthropic.Anthropic()
+            else:
+                import openai
+
+                llm_client = openai.OpenAI()
+        except ImportError as e:
+            print(f"Warning: LLM client unavailable ({e}); running in dry-run mode")
+            rev_engine_cfg.dry_run = True
+
+    # --- Constitution parsing + Goal Manager ------------------------------
+    goal_cfg = build_goal_config(constitution_text, llm_client=llm_client)
+    goal_manager = GoalManager(goal_cfg)
+    trigger_controller = TriggerController(trigger_cfg)
+    revision_engine = RevisionEngine(llm_client=llm_client, config=rev_engine_cfg)
+
+    runtime_dict = dict(goal_rl_config.get("runtime", {}))
+    runtime_cfg = GoalRLRuntimeConfig(
+        audit_log_path=runtime_dict.get("audit_log_path"),
+        max_llm_revisions=runtime_dict.get("max_llm_revisions"),
+        dry_run=rev_engine_cfg.dry_run,
+    )
+
+    # --- State manager (GRPO save-state pool) -----------------------------
+    state_manager = GRPOStateManager(
+        state_dir=Path(config.env.state_dir),
+        group_size=grpo_config.group_size,
+        num_groups=config.train.num_envs // grpo_config.group_size,
+    )
+
+    print(
+        f"[goal-rl] constitution playstyle={goal_cfg.constitution.playstyle!r}, "
+        f"L2 weights={goal_cfg.layer_two.to_dict()}, "
+        f"constraints={[c.kind.value for c in goal_cfg.layer_three.constraints]}, "
+        f"dry_run={rev_engine_cfg.dry_run}"
+    )
+
+    # --- Trainer loop -----------------------------------------------------
+    with init_wandb(
+        config=config,
+        exp_name=exp_name,
+        reward_name=reward_name,
+        policy_name=policy_name,
+        wrappers_name=wrappers_name,
+    ) as wandb_client:
+        vec = config.vectorization
+        if vec == Vectorization.serial:
+            vec = pufferlib.vector.Serial
+        elif vec == Vectorization.multiprocessing:
+            vec = pufferlib.vector.Multiprocessing
+        elif vec == Vectorization.ray:
+            vec = pufferlib.vector.Ray
+        else:
+            vec = pufferlib.vector.Multiprocessing
+
+        env_send_queues: list[Queue] = []
+        env_recv_queues: list[Queue] = []
+
+        vecenv = pufferlib.vector.make(
+            env_creator,
+            env_kwargs={
+                "env_config": config.env,
+                "wrappers_config": config.wrappers[wrappers_name],
+                "reward_config": config.rewards[reward_name]["reward"],
+                "async_config": {},
+                "sqlite_config": {"database": None},
+            },
+            num_envs=config.train.num_envs,
+            num_workers=config.train.num_workers,
+            batch_size=config.train.env_batch_size,
+            zero_copy=config.train.zero_copy,
+            backend=vec,
+        )
+        policy = make_policy(vecenv.driver_env, policy_name, config)
+
+        config.train.env = "Pokemon Red (Goal-RL)"
+        with GoalGRPO(
+            exp_name=exp_name,
+            config=config.train,
+            grpo_config=grpo_config,
+            vecenv=vecenv,
+            policy=policy,
+            rubric=goal_manager.get_rubric(),
+            state_manager=state_manager,
+            env_send_queues=env_send_queues,
+            env_recv_queues=env_recv_queues,
+            wandb_client=wandb_client,
+            goal_manager=goal_manager,
+            trigger_controller=trigger_controller,
+            frozen_evaluator=frozen_evaluator,
+            hacking_watchdog=hacking_watchdog,
+            revision_engine=revision_engine,
+            goal_runtime_config=runtime_cfg,
+        ) as trainer:
+            while not trainer.done_training():
+                trainer.run_epoch()
+
+        print("Done goal-setting RL training")
 
 
 if __name__ == "__main__":

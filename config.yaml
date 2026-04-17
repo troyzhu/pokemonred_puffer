@@ -501,6 +501,60 @@ rubric_rl:
     # Weight for blending LLM score with rule-based score (0 = rule only)
     blend_weight: 0.0
 
+# Goal-setting RL layer (runs on top of rubric_rl GRPO).
+# Design contract: docs/goal_rl.md.
+goal_rl:
+  # Free-text constitution.  Parsed once at run start (via LLM if configured,
+  # otherwise via a keyword-based fallback) into Layer-1/2/3 structured fields.
+  # Leave empty to use equal weights across all Layer-2 categories.
+  constitution: ""
+
+  # Triggers — eval and revision cadence.  See plan C04.
+  triggers:
+    # Adaptive K (safety-net interval in epochs) linearly ramps from k_min
+    # to k_max over total_epochs.  Lower K = more frequent eval.
+    k_min: 2
+    k_max: 10
+    total_epochs: 100
+    # Plateau detection on E2 scalar.
+    plateau_epsilon: 0.02
+    plateau_window: 3
+    # Revision gating.
+    revision_ceiling_epochs: 30
+    revision_cooldown_epochs: 3
+
+  # Frozen evaluator (E1 dashboard / E2 scalar).  E2 uses the baseline
+  # rubric_rl weights by default; override here to use a different
+  # canonical ruler.  See plan C02.
+  evaluator:
+    # Optional E2 override.  If unset, uses rubric_rl DEFAULT_RUBRIC_WEIGHTS.
+    e2_rubrics: null
+    # Watchdog — triggers rollback when training reward rises but E2 drops.
+    watchdog_window: 3
+    watchdog_training_rise: 0.05
+    watchdog_e2_drop: 0.05
+
+  # Revision engine — LLM-driven proposer with a primitives-library safety net.
+  # See plan C03.
+  revision_engine:
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
+    max_tokens: 1200
+    # If true, skip the LLM call and return empty proposals.  Useful for
+    # training runs that want the trigger/eval scaffolding without the
+    # revision loop (i.e. to compare "static rubric + eval protocol" vs
+    # "static rubric + eval + revision").
+    dry_run: false
+
+  # Runtime controls.
+  runtime:
+    # Append-only JSONL audit log of triggers, evals, proposals, rollbacks.
+    # Set to null to disable.
+    audit_log_path: "goal_rl_audit.jsonl"
+    # Hard ceiling on LLM revision calls per run.  null = unlimited (bounded
+    # already by trigger cooldown + ceiling).
+    max_llm_revisions: null
+
 # Policies to use for training.
 # Each policy is keyed by a name for the commandline.
 # The value for each key is the list of policies to support.
