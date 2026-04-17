@@ -170,3 +170,6 @@ experiments
 runs
 video
 wandb
+
+# temp files
+.DS_Store
