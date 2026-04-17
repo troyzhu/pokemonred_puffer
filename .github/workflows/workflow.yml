@@ -32,3 +32,5 @@ jobs:
         run: ruff check pokemonred_puffer
       - name: Run pytest
         run: python -m pytest tests
+      - name: Check docs drift (goal_rl)
+        run: python scripts/check_docs.py
